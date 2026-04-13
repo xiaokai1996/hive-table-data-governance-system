@@ -1,0 +1,18 @@
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Data and temporary outputs
+data/images/
+data/dwd_page_render/*.parquet
+data/dwd_page_ocr/*.parquet
+data/dwd_doc_aggregate/*.parquet
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS files
+.DS_Store
