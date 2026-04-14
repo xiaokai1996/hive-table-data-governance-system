@@ -1,43 +1,65 @@
-import subprocess
+import argparse
 import os
+import subprocess
 import sys
+from datetime import datetime, timezone
 
-# 获取 scripts 目录路径
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def run_script(script_name):
-    """运行指定的 Python 脚本"""
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--request-id", default=None)
+    parser.add_argument("--owner", default="demo_user")
+    return parser.parse_args()
+
+
+def default_request_id():
+    return datetime.now(timezone.utc).strftime("req_%Y%m%d%H%M%S")
+
+
+def run_script(script_name, script_args):
     script_path = os.path.join(SCRIPTS_DIR, script_name)
-    print(f"🚀 开始运行: {script_name}...")
-    
+    print(f"Starting: {script_name}")
+
     try:
-        # 使用当前解释器运行脚本
-        result = subprocess.run([sys.executable, script_path], check=True, capture_output=True, text=True)
-        print(result.stdout)
-        print(f"✅ {script_name} 运行成功！")
+        result = subprocess.run(
+            [sys.executable, script_path, *script_args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if result.stdout:
+            print(result.stdout.strip())
+        print(f"Finished: {script_name}")
         return True
-    except subprocess.CalledProcessError as e:
-        print(f"❌ {script_name} 运行出错！")
-        print(e.stderr)
+    except subprocess.CalledProcessError as error:
+        print(f"Failed: {script_name}")
+        if error.stdout:
+            print(error.stdout)
+        if error.stderr:
+            print(error.stderr)
         return False
 
+
 def main():
-    # 定义需要按顺序运行的脚本列表
+    args = parse_args()
+    request_id = args.request_id or default_request_id()
     pipeline = [
-        "step1_render.py",
-        "step2_ocr.py",
-        "step3_aggregate.py",
-        "step4_validation.py"
+        ("step0_ingest_request.py", ["--request-id", request_id, "--owner", args.owner]),
+        ("step1_render.py", ["--request-id", request_id]),
+        ("step2_ocr.py", ["--request-id", request_id]),
+        ("step3_aggregate.py", ["--request-id", request_id]),
+        ("step4_validation.py", ["--request-id", request_id]),
     ]
-    
-    print("--- 📋 开始执行项目流水线 ---")
-    
-    for script in pipeline:
-        if not run_script(script):
-            print(f"🛑 流水线在 {script} 处中断。")
+
+    print(f"Pipeline started for request_id={request_id}")
+    for script_name, script_args in pipeline:
+        if not run_script(script_name, script_args):
+            print(f"Pipeline stopped at {script_name}")
             sys.exit(1)
-            
-    print("--- 🎉 所有步骤执行完毕！ ---")
+    print(f"Pipeline finished for request_id={request_id}")
+
 
 if __name__ == "__main__":
     main()

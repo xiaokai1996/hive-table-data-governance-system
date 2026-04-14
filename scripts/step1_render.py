@@ -1,58 +1,106 @@
+import argparse
 import os
+import sys
+
 import pandas as pd
 import pypdfium2 as pdfium
-from datetime import datetime
 
-# 定义输入输出目录
-INPUT_DIR = "data/input"
-IMG_DIR = "data/images"
-OUTPUT_DIR = "data/dwd_page_render"
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
 
-# 确保输出目录存在
-os.makedirs(IMG_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+from utils.io_utils import current_ts, ensure_dir, filter_md5_doc_rows, read_parquet, resolve_local_pdf_path, save_parquet, upsert_dataframe
+from utils.path_config import DWD_PAGE_RENDER_PATH, DWD_REQUEST_DOC_TASK_PATH, PAGE_IMAGE_DIR
 
-# 用于存储每页渲染结果的元数据
-rows = []
+TASK_PATH = DWD_REQUEST_DOC_TASK_PATH
+OUTPUT_PATH = DWD_PAGE_RENDER_PATH
+IMG_DIR = PAGE_IMAGE_DIR
 
-# 遍历输入目录下的所有 PDF 文件
-for file in os.listdir(INPUT_DIR):
-    if not file.endswith(".pdf"):
-        continue
 
-    pdf_path = os.path.join(INPUT_DIR, file)
-    doc_id = file.replace(".pdf", "") # 使用文件名作为文档 ID
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--request-id", required=True)
+    return parser.parse_args()
 
-    # 加载 PDF 文档
-    pdf = pdfium.PdfDocument(pdf_path)
 
-    # 逐页渲染 PDF 为图像
-    for i in range(len(pdf)):
-        page = pdf[i]
-        # 渲染页面，scale=2 表示 2 倍分辨率，提高 OCR 识别率
-        pil_img = page.render(scale=2).to_pil()
+def main():
+    args = parse_args()
+    ensure_dir(IMG_DIR)
 
-        page_no = i + 1
-        page_id = f"{doc_id}_{page_no}"
+    task_df = read_parquet(
+        TASK_PATH,
+        default_columns=[
+            "request_id",
+            "owner",
+            "pdf_url",
+            "doc_id",
+            "file_name",
+            "submit_time",
+            "parse_needed",
+        ],
+    )
+    target_docs_df = task_df[
+        (task_df["request_id"] == args.request_id) & (task_df["parse_needed"] == True)
+    ][["request_id", "pdf_url", "doc_id"]].drop_duplicates(subset=["doc_id"])
 
-        # 保存渲染后的图像文件
-        img_path = f"{IMG_DIR}/{page_id}.png"
-        pil_img.save(img_path)
+    existing_df = read_parquet(
+        OUTPUT_PATH,
+        default_columns=[
+            "doc_id",
+            "pdf_url",
+            "page_id",
+            "page_no",
+            "image_uri",
+            "render_version",
+            "process_time",
+            "source_request_id",
+        ],
+    )
+    existing_df = filter_md5_doc_rows(existing_df)
 
-        # 收集页面级的元数据
-        rows.append({
-            "doc_id": doc_id,
-            "page_id": page_id,
-            "page_no": page_no,
-            "image_uri": img_path,
-            "render_version": "v1",
-            "process_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
+    if target_docs_df.empty:
+        save_parquet(existing_df, OUTPUT_PATH)
+        print(f"Request {args.request_id} render skipped: no new documents")
+        return
 
-# 将所有页面元数据转换为 DataFrame
-df = pd.DataFrame(rows)
+    rendered_doc_ids = set(existing_df["doc_id"].dropna().tolist()) if "doc_id" in existing_df.columns else set()
 
-# 将结果保存为 Parquet 格式，以便后续 OCR 步骤读取
-df.to_parquet(f"{OUTPUT_DIR}/data.parquet", index=False)
+    rows = []
+    for row in target_docs_df.to_dict("records"):
+        if row["doc_id"] in rendered_doc_ids:
+            continue
 
-print("✅ render 完成:", len(df), "pages")
+        pdf_path = resolve_local_pdf_path(row["pdf_url"])
+        pdf = pdfium.PdfDocument(pdf_path)
+
+        for page_index in range(len(pdf)):
+            page_no = page_index + 1
+            page_id = f"{row['doc_id']}_{page_no}"
+            image_uri = os.path.join(IMG_DIR, f"{page_id}.png")
+
+            page = pdf[page_index]
+            pil_img = page.render(scale=2).to_pil()
+            pil_img.save(image_uri)
+
+            rows.append(
+                {
+                    "doc_id": row["doc_id"],
+                    "pdf_url": row["pdf_url"],
+                    "page_id": page_id,
+                    "page_no": page_no,
+                    "image_uri": image_uri,
+                    "render_version": "v2",
+                    "process_time": current_ts(),
+                    "source_request_id": args.request_id,
+                }
+            )
+
+    new_df = pd.DataFrame(rows)
+    output_df = upsert_dataframe(existing_df, new_df, ["page_id"])
+    save_parquet(output_df, OUTPUT_PATH)
+
+    print(f"Request {args.request_id} render finished: {len(new_df)} pages")
+
+
+if __name__ == "__main__":
+    main()
